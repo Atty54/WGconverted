@@ -9,49 +9,55 @@ OUTPUT_FILE = "my_wg_sub.txt"
 def decode_husi(husi_url):
     try:
         if '?' not in husi_url: return None
-        # Берем всё, что после знака вопроса
         b64_part = husi_url.split('?')[1].strip()
         
-        # Декодируем base64 (используем urlsafe для надежности)
-        compressed = base64.urlsafe_b64decode(b64_part + '==')
+        # Исправляем padding Base64 и меняем символы на стандартные
+        b64_part = b64_part.replace('-', '+').replace('_', '/')
+        compressed = base64.b64decode(b64_part + '==')
         
-        # Разжимаем (пробуем raw inflate -15, так как это стандарт sing-box)
-        try:
-            decompressed = zlib.decompress(compressed, -15)
-        except zlib.error:
-            decompressed = zlib.decompress(compressed)
+        # Метод перебора для Zlib (Deflate / Raw / Standard)
+        decompressed = None
+        for wbits in [-zlib.MAX_WBITS, zlib.MAX_WBITS, zlib.MAX_WBITS | 16]:
+            try:
+                decompressed = zlib.decompress(compressed, wbits)
+                if decompressed: break
+            except:
+                continue
+        
+        if not decompressed:
+            return None
             
-        # ПРИНУДИТЕЛЬНО декодируем в utf-8, игнорируя ошибки кодировки
         json_str = decompressed.decode('utf-8', errors='ignore')
         data = json.loads(json_str)
         
-        # Извлекаем данные
+        # Мапинг полей Sing-box -> WG URI
         server = data.get('server')
         port = data.get('server_port')
         pk = data.get('private_key')
         pub = data.get('server_pub') or data.get('public_key')
         
-        res_list = data.get('reserved', [])
-        res = "-".join(map(str, res_list)) if isinstance(res_list, list) else str(res_list)
+        # Обработка Reserved
+        res_val = data.get('reserved', [0,0,0])
+        res = "-".join(map(str, res_val)) if isinstance(res_val, list) else str(res_val)
         
-        addr_list = data.get('local_address', [])
-        addr = ",".join(addr_list) if isinstance(addr_list, list) else str(addr_list)
+        # Обработка адресов
+        addr_val = data.get('local_address', ["172.16.0.2/32"])
+        addr = ",".join(addr_val) if isinstance(addr_val, list) else str(addr_val)
         
         if server and pk:
+            # Формируем искомую ссылку
             return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={addr}&reserved={res}&mtu=1280#WARP_{server}"
-        
+            
+    except Exception:
         return None
-    except Exception as e:
-        # Теперь мы увидим реальную ошибку, если она останется
-        print(f"Ошибка парсинга: {e}")
-        return None
+    return None
 
 def main():
-    print(f"Загрузка: {SOURCE_URL}")
+    print(f"Загрузка из {SOURCE_URL}...")
     try:
-        response = requests.get(SOURCE_URL)
-        response.encoding = 'utf-8'
-        lines = response.text.splitlines()
+        r = requests.get(SOURCE_URL)
+        r.raise_for_status()
+        lines = r.text.splitlines()
         
         results = []
         for line in lines:
@@ -64,12 +70,12 @@ def main():
         if results:
             with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
                 f.write("\n".join(results))
-            print(f"Успех! Сгенерировано ссылок: {len(results)}")
+            print(f"Успех! Сгенерировано {len(results)} ссылок.")
         else:
-            print("Список пуст. Проверь логи ошибок выше.")
+            print("Не удалось декодировать ни одной ссылки. Проверь формат источника.")
             
     except Exception as e:
-        print(f"Ошибка загрузки файла: {e}")
+        print(f"Ошибка: {e}")
 
 if __name__ == "__main__":
     main()
