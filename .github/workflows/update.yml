@@ -1,0 +1,32 @@
+name: Update WG Subscription
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Раз в сутки
+  workflow_dispatch: # Возможность запустить вручную кнопкой
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run converter
+        run: python convert.py
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add my_wg_sub.txt
+          git commit -m "Update subscription $(date)" || exit 0
+          git push
