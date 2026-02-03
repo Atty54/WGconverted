@@ -3,80 +3,85 @@ import zlib
 import msgpack
 import requests
 
-SOURCE_URL = "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/husi-wg.txt"
+SOURCE_URLS = [
+    "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/husi-wg.txt",
+    "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/nekobox-wg.txt"
+]
 OUTPUT_FILE = "my_wg_sub.txt"
 
 def decode_reserved(res_data):
-    """Превращает байты или base64-строку reserved в формат 'число-число-число'"""
     try:
-        if isinstance(res_data, str):
+        if isinstance(res_data, (bytes, bytearray)):
+            return "-".join(map(str, list(res_data)))
+        elif isinstance(res_data, str):
+            # Если это строка (Base64), декодируем её в байты
             res_bytes = base64.b64decode(res_data)
-        else:
-            res_bytes = res_data
-        return "-".join(map(str, list(res_bytes)))
+            return "-".join(map(str, list(res_bytes)))
+        return "0-0-0"
     except:
         return "0-0-0"
 
-def parse_singbox_binary(raw_bytes):
+def parse_link(payload):
     try:
-        # Декодируем MsgPack. 
-        # Sing-box использует карты с числовыми ключами.
-        data = msgpack.unpackb(raw_bytes, raw=False, strict_map_key=False)
+        # 1. Base64 коррекция
+        payload = payload.replace('-', '+').replace('_', '/')
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.b64decode(payload)
         
-        # Карта полей Sing-box (опытным путем из NekoBox):
-        name = data.get(1, "WARP")
-        server = data.get(2)
-        port = data.get(3)
-        local_addrs = data.get(4, [])
-        pk = data.get(5)
-        pub = data.get(6)
-        mtu = data.get(7, 1280)
-        reserved_raw = data.get(8, b"\x00\x00\x00")
-        
-        if not server or not pk:
-            return None
+        # 2. Zlib декомпрессия (78 da)
+        if decoded[0] == 0x78:
+            raw_data = zlib.decompress(decoded)
+        else:
+            raw_data = decoded
 
-        reserved = decode_reserved(reserved_raw)
-        addr_str = ",".join(local_addrs) if isinstance(local_addrs, list) else str(local_addrs)
+        # 3. MsgPack парсинг
+        # Используем raw=False чтобы ключи-числа не превратились в байты
+        data = msgpack.unpackb(raw_data, raw=False, strict_map_key=False)
         
-        # Собираем полную ссылку со ВСЕМИ параметрами
-        link = (f"wg://{server}:{port}?private_key={pk}&public_key={pub}"
-                f"&local_address={addr_str}&reserved={reserved}&mtu={mtu}#{name}")
-        return link
-    except Exception as e:
+        # Обработка словаря (Map)
+        if isinstance(data, dict):
+            name = data.get(1, "WARP")
+            server = data.get(2)
+            port = data.get(3)
+            local_addrs = data.get(4, [])
+            pk = data.get(5)
+            pub = data.get(6)
+            mtu = data.get(7, 1280)
+            res = data.get(8, b"\x00\x00\x00")
+            
+            if server and pk:
+                addr_str = ",".join(local_addrs) if isinstance(local_addrs, list) else str(local_addrs)
+                return (f"wg://{server}:{port}?private_key={pk}&public_key={pub}"
+                        f"&local_address={addr_str}&reserved={decode_reserved(res)}&mtu={mtu}#{name}")
+    except:
         return None
+    return None
+
+def test_your_example():
+    print("\n--- [ИНСПЕКЦИЯ]: ЭТАЛОННЫЙ ПРИМЕР ---")
+    example_b64 = "eNoNzjsOgjAAANCqcekp3E1KW6DWJk6Gxh9iED8r0IIkfuIvgBurd2E38TYewRPoO8FrAgDy7KLR8RrvUfZ9twB4kR5FhCGMqGFSSBlmwuphLAjBgieqL6yQ2yLEcSgSKxJca2YQymvmYbN7VqXkOvAVT48qjtJisb9f_E0ebWeF5jb3w3xuWoM6Omy9YVcSWTiu7Ksym9KRbZDl6vYY4cl9fbLJjuaLJC1Pgwq0AXDd86fx70IIx52lE3Tk2HcgfFbVD6BkOHk"
+    res = parse_link(example_b64)
+    if res:
+        print(f"РЕЗУЛЬТАТ ЭТАЛОНА: {res[:80]}...")
+    else:
+        print("ОШИБКА: Эталон не распарсился!")
 
 def main():
-    print(f"Загрузка: {SOURCE_URL}")
-    r = requests.get(SOURCE_URL)
-    results = []
+    test_your_example()
     
-    for line in r.text.splitlines():
-        line = line.strip()
-        if '?' not in line: continue
-        
+    results = []
+    for url in SOURCE_URLS:
+        print(f"\n--- [ИНСПЕКЦИЯ]: ЗАГРУЗКА {url} ---")
         try:
-            # Чистим Base64
-            payload = line.split('?')[1].replace('-', '+').replace('_', '/')
-            payload += "=" * (-len(payload) % 4)
-            decoded = base64.b64decode(payload)
+            r = requests.get(url, timeout=10)
+            lines = r.text.strip().splitlines()
             
-            # Разжимаем Zlib (сигнатура 78)
-            if decoded[0] == 0x78:
-                raw_data = zlib.decompress(decoded)
-                res = parse_singbox_binary(raw_data)
-                if res:
-                    results.append(res)
-        except:
-            continue
-
-    if results:
-        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
-            f.write("\n".join(results))
-        print(f"ПОБЕДА! Собрано {len(results)} полных конфигов.")
-        print(f"Пример первого: {results[0][:100]}...")
-    else:
-        print("Данные не удалось распарсить. Возможно, изменились ID полей.")
-
-if __name__ == "__main__":
-    main()
+            # Выводим первые 3 строки для контроля
+            for i, line in enumerate(lines[:3]):
+                print(f"Строка {i}: {line[:60]}...")
+            
+            print(f"Всего строк в файле: {len(lines)}")
+            
+            for line in lines:
+                if '?' not in line: continue
+                payload = line.split('?')
