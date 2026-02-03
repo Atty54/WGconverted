@@ -1,61 +1,48 @@
 import base64
 import zlib
-import json
 import msgpack
 import requests
 
 SOURCE_URL = "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/husi-wg.txt"
 OUTPUT_FILE = "my_wg_sub.txt"
 
-def sing_box_parse(url):
+def decode_reserved(res_data):
+    """Превращает байты или base64-строку reserved в формат 'число-число-число'"""
     try:
-        # Извлекаем payload
-        payload = url.split('?')[1].strip()
-        if payload.startswith('data='): payload = payload[5:]
-        
-        # 1. Декодируем Base64
-        payload = payload.replace('-', '+').replace('_', '/')
-        payload += "=" * (-len(payload) % 4)
-        data = base64.b64decode(payload)
-        
-        # 2. Проверка на Zlib (Sing-box/Husi способ)
-        # Если первые байты 0x78 0x9c или 0x78 0x01 — это Zlib
-        if len(data) > 2 and data[0] == 0x78:
-            try:
-                data = zlib.decompress(data)
-            except:
-                pass # Если не вышло, пробуем сырым
+        if isinstance(res_data, str):
+            res_bytes = base64.b64decode(res_data)
+        else:
+            res_bytes = res_data
+        return "-".join(map(str, list(res_bytes)))
+    except:
+        return "0-0-0"
 
-        # 3. Определение формата: MsgPack или JSON
-        decoded_obj = None
-        first_byte = data[0]
+def parse_singbox_binary(raw_bytes):
+    try:
+        # Декодируем MsgPack. 
+        # Sing-box использует карты с числовыми ключами.
+        data = msgpack.unpackb(raw_bytes, raw=False, strict_map_key=False)
+        
+        # Карта полей Sing-box (опытным путем из NekoBox):
+        name = data.get(1, "WARP")
+        server = data.get(2)
+        port = data.get(3)
+        local_addrs = data.get(4, [])
+        pk = data.get(5)
+        pub = data.get(6)
+        mtu = data.get(7, 1280)
+        reserved_raw = data.get(8, b"\x00\x00\x00")
+        
+        if not server or not pk:
+            return None
 
-        # Маркеры MessagePack для Map (0x80-0x8f, 0xde, 0xdf)
-        if (0x80 <= first_byte <= 0x8f) or first_byte == 0xde or first_byte == 0xdf:
-            decoded_obj = msgpack.unpackb(data, raw=False)
-        # Маркер JSON
-        elif first_byte == 0x7b: # Символ '{'
-            decoded_obj = json.loads(data.decode('utf-8', errors='ignore'))
+        reserved = decode_reserved(reserved_raw)
+        addr_str = ",".join(local_addrs) if isinstance(local_addrs, list) else str(local_addrs)
         
-        if not decoded_obj: return None
-
-        # 4. Сборка ссылки по стандартам WireGuard
-        server = decoded_obj.get('server')
-        port = decoded_obj.get('server_port')
-        pk = decoded_obj.get('private_key')
-        pub = decoded_obj.get('server_pub') or decoded_obj.get('public_key', '')
-        
-        # Обработка Reserved (в бинарном виде это массив байт)
-        res_raw = decoded_obj.get('reserved', [0, 0, 0])
-        res = "-".join(map(str, res_raw)) if isinstance(res_raw, list) else str(res_raw)
-        
-        # Локальные адреса
-        addr_raw = decoded_obj.get('local_address', ["172.16.0.2/32"])
-        addr = ",".join(addr_raw) if isinstance(addr_raw, list) else str(addr_raw)
-        
-        if server and pk:
-            return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={addr}&reserved={res}&mtu=1280#WARP_{server}"
-
+        # Собираем полную ссылку со ВСЕМИ параметрами
+        link = (f"wg://{server}:{port}?private_key={pk}&public_key={pub}"
+                f"&local_address={addr_str}&reserved={reserved}&mtu={mtu}#{name}")
+        return link
     except Exception as e:
         return None
 
@@ -63,17 +50,33 @@ def main():
     print(f"Загрузка: {SOURCE_URL}")
     r = requests.get(SOURCE_URL)
     results = []
-    for line in r.text.splitlines():
-        if "://" in line:
-            link = sing_box_parse(line.strip())
-            if link: results.append(link)
     
+    for line in r.text.splitlines():
+        line = line.strip()
+        if '?' not in line: continue
+        
+        try:
+            # Чистим Base64
+            payload = line.split('?')[1].replace('-', '+').replace('_', '/')
+            payload += "=" * (-len(payload) % 4)
+            decoded = base64.b64decode(payload)
+            
+            # Разжимаем Zlib (сигнатура 78)
+            if decoded[0] == 0x78:
+                raw_data = zlib.decompress(decoded)
+                res = parse_singbox_binary(raw_data)
+                if res:
+                    results.append(res)
+        except:
+            continue
+
     if results:
         with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
             f.write("\n".join(results))
-        print(f"Успех! Сгенерировано {len(results)} ссылок.")
+        print(f"ПОБЕДА! Собрано {len(results)} полных конфигов.")
+        print(f"Пример первого: {results[0][:100]}...")
     else:
-        print("Ошибка: Парсер Sing-box не нашел валидных данных.")
+        print("Данные не удалось распарсить. Возможно, изменились ID полей.")
 
 if __name__ == "__main__":
     main()
