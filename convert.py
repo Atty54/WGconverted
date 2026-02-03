@@ -7,18 +7,6 @@ SOURCE_URLS = [
     "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/husi-wg.txt",
     "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/nekobox-wg.txt"
 ]
-OUTPUT_FILE = "my_wg_sub.txt"
-
-def decode_reserved(res_data):
-    try:
-        if isinstance(res_data, (bytes, bytearray)):
-            return "-".join(map(str, list(res_data)))
-        elif isinstance(res_data, str):
-            res_bytes = base64.b64decode(res_data)
-            return "-".join(map(str, list(res_bytes)))
-        return "0-0-0"
-    except:
-        return "0-0-0"
 
 def parse_link(payload):
     try:
@@ -33,57 +21,68 @@ def parse_link(payload):
         else:
             raw_data = decoded
 
-        # 3. MsgPack
-        data = msgpack.unpackb(raw_data, raw=False, strict_map_key=False)
+        # 3. MsgPack - пробуем raw=True, чтобы не падать на кодировках
+        # Это вернет ключи и значения как bytes, которые мы потом декодируем
+        data = msgpack.unpackb(raw_data, raw=True, strict_map_key=False)
         
-        if isinstance(data, dict):
-            name = data.get(1, "WARP")
-            server = data.get(2)
-            port = data.get(3)
-            addrs = data.get(4, [])
-            pk = data.get(5)
-            pub = data.get(6)
-            mtu = data.get(7, 1280)
-            res = data.get(8, b"\x00\x00\x00")
-            
-            if server and pk:
-                addr_str = ",".join(addrs) if isinstance(addrs, list) else str(addrs)
-                return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={addr_str}&reserved={decode_reserved(res)}&mtu={mtu}#{name}"
-    except:
-        pass
+        # Функция-помощник для безопасного извлечения данных из байтовых ключей
+        def get_val(idx):
+            # Проверяем и числовой ключ, и байтовый (так как raw=True)
+            val = data.get(idx) or data.get(str(idx).encode())
+            if isinstance(val, bytes):
+                try: return val.decode('utf-8')
+                except: return val
+            return val
+
+        # Извлекаем по ID (теперь ключи в словаре - это байты b'\x01', b'\x02' и т.д.)
+        name = get_val(1) or "WARP"
+        server = get_val(2)
+        port = get_val(3)
+        addrs = get_val(4) or []
+        pk = get_val(5)
+        pub = get_val(6)
+        mtu = get_val(7) or 1280
+        res_raw = get_val(8) or b"\x00\x00\x00"
+
+        if server and pk:
+            # Обработка адресов (они могут быть списком байтов)
+            if isinstance(addrs, list):
+                clean_addrs = [a.decode() if isinstance(a, bytes) else str(a) for a in addrs]
+                addr_str = ",".join(clean_addrs)
+            else:
+                addr_str = addrs.decode() if isinstance(addrs, bytes) else str(addrs)
+
+            # Reserved в формат 0-0-0
+            res_bytes = res_raw if isinstance(res_raw, bytes) else base64.b64decode(res_raw)
+            reserved = "-".join(map(str, list(res_bytes)))
+
+            return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={addr_str}&reserved={reserved}&mtu={mtu}#{name}"
+    except Exception as e:
+        # Если это тест эталона, мы увидим ошибку в консоли
+        return f"ERROR:{e}"
     return None
 
 def main():
-    # Тест эталона
-    example_b64 = "eNoNzjsOgjAAANCqcekp3E1KW6DWJk6Gxh9iED8r0IIkfuIvgBurd2E38TYewRPoO8FrAgDy7KLR8RrvUfZ9twB4kR5FhCGMqGFSSBlmwuphLAjBgieqL6yQ2yLEcSgSKxJca2YQymvmYbN7VqXkOvAVT48qjtJisb9f_E0ebWeF5jb3w3xuWoM6Omy9YVcSWTiu7Ksym9KRbZDl6vYY4cl9fbLJjuaLJC1Pgwq0AXDd86fx70IIx52lE3Tk2HcgfFbVD6BkOHk"
-    test_res = parse_link(example_b64)
-    print(f"--- [ТЕСТ ЭТАЛОНА]: {'УСПЕХ' if test_res else 'ПРОВАЛ'} ---")
+    # Твой пример
+    example = "eNoNzjsOgjAAANCqcekp3E1KW6DWJk6Gxh9iED8r0IIkfuIvgBurd2E38TYewRPoO8FrAgDy7KLR8RrvUfZ9twB4kR5FhCGMqGFSSBlmwuphLAjBgieqL6yQ2yLEcSgSKxJca2YQymvmYbN7VqXkOvAVT48qjtJisb9f_E0ebWeF5jb3w3xuWoM6Omy9YVcSWTiu7Ksym9KRbZDl6vYY4cl9fbLJjuaLJC1Pgwq0AXDd86fx70IIx52lE3Tk2HcgfFbVD6BkOHk"
+    test_res = parse_link(example)
+    print(f"--- РЕЗУЛЬТАТ ТЕСТА: {test_res} ---")
+
+    if "ERROR" in str(test_res):
+        return # Останавливаемся, если даже эталон не прошел
 
     results = []
     for url in SOURCE_URLS:
-        print(f"\n--- [ИНСПЕКЦИЯ]: {url} ---")
-        try:
-            r = requests.get(url, timeout=10)
-            lines = r.text.strip().splitlines()
-            
-            # Логируем первые 2 строки для проверки
-            for i, l in enumerate(lines[:2]):
-                print(f"RAW {i}: {l[:60]}...")
+        r = requests.get(url)
+        for line in r.text.splitlines():
+            if '?' in line:
+                link = parse_link(line.split('?')[1])
+                if link and "ERROR" not in link:
+                    results.append(link)
 
-            for line in lines:
-                if '?' in line:
-                    res = parse_link(line.split('?')[1])
-                    if res:
-                        results.append(res)
-        except Exception as e:
-            print(f"Ошибка при работе с URL: {e}")
-
-    if results:
-        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
-            f.write("\n".join(results))
-        print(f"\nФИНАЛ: Собрано {len(results)} ссылок.")
-    else:
-        print("\nФИНАЛ: Ссылок не найдено.")
+    with open("my_wg_sub.txt", "w", encoding='utf-8') as f:
+        f.write("\n".join(results))
+    print(f"ФИНАЛ: Собрано {len(results)}")
 
 if __name__ == "__main__":
     main()
