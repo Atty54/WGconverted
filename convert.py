@@ -4,109 +4,100 @@ import struct
 import re
 import requests
 
-SOURCE_URLS = [
-    "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/nekobox-wg.txt"
-]
+SOURCE_URLS = ["https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/nekobox-wg.txt"]
 OUTPUT_FILE = "my_wg_sub.txt"
 
 def manual_extract(raw_data):
     try:
-        # 1. СЕРВЕР: Читаем до первого байта < 32
-        server_bytes = []
-        for b in raw_data[4:40]:
-            if b < 32: break
-            server_bytes.append(b)
-        server_raw = bytes(server_bytes).decode('ascii', errors='ignore').strip()
+        content_str = raw_data.decode('ascii', errors='ignore')
         
-        # Индекс конца домена
-        end_server_idx = 4 + len(server_bytes)
-
-        # Фикс домена .ir
-        if server_raw.endswith(".ncl.i") or server_raw.endswith(".nscl.i"):
-            server_raw += "r"
-
-        # 2. ПОРТ: Little-Endian (<H)
-        # Пропускаем 1 байт (разделитель) после домена
-        port_offset = end_server_idx + 1
-        port = struct.unpack('<H', raw_data[port_offset:port_offset+2])[0]
-        
-        # Если порт слишком мал (например, попали на разделитель), 
-        # пробуем сдвинуться на 1 байт вперед
-        if port < 100:
-            port = struct.unpack('<H', raw_data[port_offset+1:port_offset+3])[0]
-
-        # 3. КЛЮЧИ
-        content = raw_data.decode('ascii', errors='ignore')
-        keys = re.findall(r'[A-Za-z0-9+/]{43}=', content)
+        # 1. КЛЮЧИ
+        keys = re.findall(r'[A-Za-z0-9+/]{43}=', content_str)
         if len(keys) < 2: return None
         pk, pub = keys[0], keys[1]
-
-        # 4. ИМЕНА: Adele или OPS
+        
+        # 2. ИМЯ (Якорь)
         name = "WARP"
-        if "I SET FIRE" in content: name = "I SET FIRE"
-        elif "TO THE RAIN" in content: name = "TO THE RAIN"
-        else:
-            name_match = re.search(r'(OPS\s*-\s*\d+)', content)
-            if name_match: name = name_match.group(1)
-            else: name = re.sub(r'[^A-Z0-9\-\s]', '', content[-15:]).strip()
+        patterns = [r'I SET FIRE', r'TO THE RAIN', r'(?:OPS|D2O)\s*-\s*\d+']
+        for p in patterns:
+            m = re.search(p, content_str)
+            if m:
+                name = m.group(0)
+                break
         
-        # 5. IP АДРЕСА: Только чистые группы цифр (убираем спецсимволы в конце)
-        ipv4_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', content)
-        ipv6_match = re.search(r'([0-9a-fA-F:]+:[0-9a-fA-F:]+)', content)
-        
-        addrs = []
-        if ipv4_match: addrs.append(f"{ipv4_match.group(1)}/32")
-        if ipv6_match:
-            v6 = ipv6_match.group(1).strip(':')
-            if v6.count(':') >= 2: addrs.append(f"{v6}/128")
-        local_address = ",".join(addrs)
+        name_idx = raw_data.find(name.encode())
 
-        # 6. RESERVED и MTU (привязка к имени)
-        name_idx = raw_data.find(name[:5].encode())
-        if name_idx > 20:
-            # Reserved: 3 байта перед именем (с учетом разделителя)
-            res_bytes = raw_data[name_idx-4:name_idx-1]
-            if 0 in list(res_bytes): res_bytes = raw_data[name_idx-5:name_idx-2]
-            
-            # MTU: пробуем найти 1280 (00 05) или 1420 (8C 05) в зоне перед Reserved
-            mtu = 1280
-            mtu_area = raw_data[name_idx-10:name_idx-3]
-            for i in range(len(mtu_area)-1):
-                m = struct.unpack('<H', mtu_area[i:i+2])[0]
-                if 1200 <= m <= 1500:
-                    mtu = m
-                    break
-        else:
-            res_bytes = raw_data[171:174]
-            mtu = 1280
+        # 3. СЕРВЕР И ПОРТ (Поиск по структуре)
+        # Ищем домен в начале
+        srv_b = []
+        for b in raw_data[4:40]:
+            if b < 32: break
+            srv_b.append(b)
+        server = bytes(srv_b).decode('ascii', errors='ignore')
+        if ".nscl.i" in server: server = server.replace(".i", ".ir")
 
-        reserved = "-".join(map(str, list(res_bytes)))
+        # ПОРТ: Ищем 2 байта, которые в сумме дают что-то похожее на 1002, 903 и т.д.
+        # В MsgPack порт обычно идет после маркера 0xCD
+        port = 0
+        port_area = raw_data[4 + len(srv_b) : 4 + len(srv_b) + 10]
+        for i in range(len(port_area)-1):
+            val = struct.unpack('>H', port_area[i:i+2])[0]
+            if 400 < val < 60000: # Диапазон реальных портов
+                port = val
+                break
 
-        return f"wg://{server_raw}:{port}?private_key={pk}&public_key={pub}&local_address={local_address}&reserved={reserved}&mtu={mtu}#{name}"
+        # 4. RESERVED (3 байта из 4-х символьного блока перед именем)
+        # Если блок zD2C, то Reserved это коды символов z, D, 2
+        # Мы ищем 4 печатных символа прямо перед длиной имени (name_idx - 1)
+        res_area = raw_data[name_idx-5:name_idx-1]
+        # Берем только первые 3 байта из этого блока
+        reserved = f"{res_area[0]}-{res_area[1]}-{res_area[2]}"
+
+        # 5. IP АДРЕСА
+        # Вытаскиваем IPv6 по паттерну, игнорируя прилипшие символы
+        v6_match = re.search(r'([0-9a-fA-F:]{15,})', content_str)
+        local_address = "172.16.0.2/32"
+        if v6_match:
+            v6 = v6_match.group(1).strip(':')
+            # Важно: отсекаем порт, если он приклеился к IPv6
+            if v6.count(':') > 7: 
+                v6 = ':'.join(v6.split(':')[:8])
+            local_address += f",{v6}/128"
+
+        # 6. MTU
+        # Обычно это 1300 (05 14 в Big-Endian или 14 05 в Little)
+        mtu = 1280
+        mtu_search = raw_data[name_idx-10:name_idx-4]
+        for i in range(len(mtu_search)-1):
+            m = struct.unpack('>H', mtu_search[i:i+2])[0]
+            if 1280 <= m <= 1500:
+                mtu = m
+                break
+
+        return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={local_address}&reserved={reserved}&mtu={mtu}#{name}"
     except:
         return None
 
 def main():
-    results = []
-    for url in SOURCE_URLS:
-        try:
-            r = requests.get(url, timeout=15)
-            for line in r.text.splitlines():
-                if '?' not in line: continue
-                try:
-                    payload = line.split('?')[1].replace('-', '+').replace('_', '/')
-                    payload += "=" * (-len(payload) % 4)
-                    decoded = base64.b64decode(payload)
-                    if decoded[0] == 0x78:
-                        raw = zlib.decompress(decoded)
-                        link = manual_extract(raw)
-                        if link: results.append(link)
-                except: continue
-        except: continue
-
-    with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
-        f.write("\n".join(results))
-    print(f"Done: {len(results)}")
+    try:
+        r = requests.get(SOURCE_URLS[0], timeout=15)
+        results = []
+        for line in r.text.splitlines():
+            if '?' not in line: continue
+            try:
+                payload = line.split('?')[1].replace('-', '+').replace('_', '/')
+                payload += "=" * (-len(payload) % 4)
+                decoded = base64.b64decode(payload)
+                if decoded[0] == 0x78:
+                    raw = zlib.decompress(decoded)
+                    link = manual_extract(raw)
+                    if link: results.append(link)
+            except: continue
+        
+        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
+            f.write("\n".join(results))
+    except:
+        pass
 
 if __name__ == "__main__":
     main()
