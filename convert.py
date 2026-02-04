@@ -8,96 +8,76 @@ SOURCE_URLS = [
     "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/husi-wg.txt",
     "https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/nekobox-wg.txt"
 ]
-OUTPUT_FILE = "my_wg_sub.txt"
 
 def manual_extract(raw_data):
     try:
-        # 1. Сервер: от 4-го байта до первого нуля
-        server_end = raw_data.find(b'\x00', 4)
-        if server_end == -1: return None
-        server = raw_data[4:server_end].decode('ascii', errors='ignore').strip()
-        if server.endswith(".i"): server += "r"
+        # 1. СЕРВЕР: Читаем до первого нулевого байта или спецсимвола < 32
+        server_bytes = []
+        for b in raw_data[4:]:
+            if b < 32: break
+            server_bytes.append(b)
+        server = bytes(server_bytes).decode('ascii', errors='ignore').strip()
         
-        # 2. Порт: строго за сервером (через 1 байт типа поля)
-        # В этой структуре Sing-box: [ID][LEN][DATA], порт обычно через 1-2 байта после домена
-        port_idx = server_end + 2 
-        if port_idx + 2 > len(raw_data): return None
-        port = struct.unpack('<H', raw_data[port_idx:port_idx+2])[0]
+        # Индекс, на котором закончился сервер
+        end_server_idx = 4 + len(server_bytes)
+        
+        # Фикс домена .ir
+        if server.endswith(".ncl.i") or server.endswith(".nscl.i"):
+            server += "r"
 
-        # 3. Ключи: ищем по маске Base64
+        # 2. ПОРТ: Он идет сразу после байта-разделителя за сервером
+        # В этом формате это обычно Big-Endian uint16
+        port_offset = end_server_idx + 1
+        port = struct.unpack('>H', raw_data[port_offset:port_offset+2])[0]
+        
+        # Если порт получился странный ( < 100), пробуем сместиться на 1 байт
+        if port < 80:
+            port = struct.unpack('>H', raw_data[port_offset+1:port_offset+3])[0]
+
+        # 3. КЛЮЧИ
         content_str = raw_data.decode('ascii', errors='ignore')
         keys = re.findall(r'[A-Za-z0-9+/]{42,43}=', content_str)
         if len(keys) < 2: return None
         pk, pub = keys[0], keys[1]
 
-        # 4. IP-адреса: жадный поиск
-        # Ищем группы цифр, разделенные точками, и не даем им обрываться на точке
-        ipv4_candidates = re.findall(r'(\d{1,3}(?:\.\d{1,3}){3})', content_str)
-        ipv6_candidates = re.findall(r'([0-9a-fA-F:]+:[0-9a-fA-F:]+(?:/[0-9]+)?)', content_str)
+        # 4. ИМЯ (в самом конце)
+        # Ищем паттерн OPS - XXX
+        name_match = re.search(r'OPS\s*-\s*\d+', content_str)
+        name = name_match.group(0) if name_match else "WARP"
+
+        # 5. RESERVED (3 байта ПЕРЕД именем)
+        # Ищем индекс начала имени в байтах
+        name_bytes = name.encode()
+        name_idx = raw_data.find(name_bytes)
+        # Reserved обычно за 4-5 байт до имени
+        res_chunk = raw_data[name_idx-4:name_idx-1]
+        if 0 in list(res_chunk): # Если опять нули, берем чуть левее
+            res_chunk = raw_data[name_idx-5:name_idx-2]
+        
+        reserved = "-".join(map(str, list(res_chunk)))
+
+        # 6. IP АДРЕСА
+        # Ищем чистые IP без мусора в конце
+        ipv4 = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', content_str)
+        ipv6 = re.search(r'([0-9a-fA-F:]+:[0-9a-fA-F:]+)', content_str)
         
         addrs = []
-        if ipv4_candidates:
-            # Берем первый найденный IPv4 и убеждаемся, что он полный
-            ip = ipv4_candidates[0]
-            addrs.append(f"{ip}/32")
-        if ipv6_candidates:
-            ip = ipv6_candidates[0]
-            if '/' not in ip: ip += "/128"
-            addrs.append(ip)
+        if ipv4: addrs.append(f"{ipv4.group(1)}/32")
+        if ipv6:
+            v6 = ipv6.group(1)
+            if v6.endswith(':'): v6 = v6[:-1]
+            addrs.append(f"{v6}/128")
         
-        local_address = ",".join(addrs) if addrs else "172.16.0.2/32"
+        local_address = ",".join(addrs)
 
-        # 5. MTU: ищем число в районе офсета 167
+        # 7. MTU
+        # В дампе мы видели 1280 и 5249 (что явно ошибка). 
+        # MTU в этих конфигах обычно перед Reserved.
         mtu = 1280
-        try:
-            val = struct.unpack('<H', raw_data[167:169])[0]
-            if 500 < val < 9000: # Просто проверка на адекватность
-                mtu = val
-        except: pass
-
-        # 6. Reserved: 3 байта (обычно перед именем в конце)
-        # Твой Reserved: 'MMqb' (48 203 166). Ищем 3 байта перед концом.
-        res_bytes = raw_data[171:174]
-        # Если там нули, берем байты 171-173 принудительно, какими бы они ни были
-        reserved = "-".join(map(str, list(res_bytes)))
-
-        # 7. Имя профиля: всё, что после последнего '='
-        parts = content_str.split('=')
-        name = parts[-1].strip() if len(parts) > 2 else "WARP"
-        # Убираем непечатные символы из имени
-        name = "".join(filter(lambda x: x.isupper() or x.isspace(), name)).strip()
+        mtu_raw = struct.unpack('>H', raw_data[name_idx-7:name_idx-5])[0]
+        if 1200 <= mtu_raw <= 1500:
+            mtu = mtu_raw
 
         return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={local_address}&reserved={reserved}&mtu={mtu}#{name}"
-    except Exception as e:
+    except:
         return None
-
-def main():
-    results = []
-    for url in SOURCE_URLS:
-        print(f"Парсинг {url}")
-        try:
-            r = requests.get(url, timeout=10)
-            for line in r.text.splitlines():
-                if '?' not in line: continue
-                try:
-                    payload = line.split('?')[1].replace('-', '+').replace('_', '/')
-                    payload += "=" * (-len(payload) % 4)
-                    decoded = base64.b64decode(payload)
-                    if decoded[0] == 0x78:
-                        raw = zlib.decompress(decoded)
-                        link = manual_extract(raw)
-                        if link: results.append(link)
-                except: continue
-        except: continue
-
-    if results:
-        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
-            f.write("\n".join(results))
-        print(f"Готово! Сгенерировано: {len(results)}")
-    else:
-        # Если ссылок 0, создадим пустой файл, чтобы Git увидел изменения (если файла не было)
-        open(OUTPUT_FILE, 'a').close()
-        print("ВНИМАНИЕ: Ссылок не найдено.")
-
-if __name__ == "__main__":
-    main()
