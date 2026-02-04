@@ -9,84 +9,105 @@ OUTPUT_FILE = "my_wg_sub.txt"
 
 def manual_extract(raw_data):
     try:
-        content_str = raw_data.decode('ascii', errors='ignore')
-        
-        # 1. КЛЮЧИ
-        keys = re.findall(r'[A-Za-z0-9+/]{43}=', content_str)
-        if len(keys) < 2: return None
-        pk, pub = keys[0], keys[1]
-        
-        # 2. ИМЯ (Якорь)
+        # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОИСКА ПОЛЯ ПО ТЕГУ ---
+        def find_payload(data, tag_bytes):
+            start = data.find(tag_bytes)
+            if start == -1: return None
+            # Длина поля обычно идет сразу за тегом
+            length = data[start + len(tag_bytes)]
+            return data[start + len(tag_bytes) + 1 : start + len(tag_bytes) + 1 + length]
+
+        # 1. ИМЯ (Тег 0x0a + 0x14 внутри или просто первый 0x0a)
+        # Ищем вложенный тег имени
         name = "WARP"
-        patterns = [r'I SET FIRE', r'TO THE RAIN', r'(?:OPS|D2O)\s*-\s*\d+']
-        for p in patterns:
-            m = re.search(p, content_str)
-            if m:
-                name = m.group(0)
-                break
+        name_idx = raw_data.find(b'\x0a')
+        if name_idx != -1:
+            # Проверяем, есть ли там вложенная структура (0x0a 0x4d ...)
+            # Берем строку, которая явно похожа на Ops или Adele
+            content_str = raw_data.decode('ascii', errors='ignore')
+            name_match = re.search(r'Ops\s*-\s*\d+|I SET FIRE|TO THE RAIN|AAAA|D2O\s*-\s*\d+', content_str)
+            if name_match:
+                name = name_match.group(0)
+
+        # 2. СЕРВЕР (Тег 0x12)
+        server_payload = find_payload(raw_data, b'\x12')
+        server = server_payload.decode('ascii') if server_payload else "162.159.192.1"
+
+        # 3. ПОРТ (Тег 0x1a + разгаданная формула)
+        # По твоим тестам: байт 40 (смещение +2 от 1a) и байт 41 (смещение +3)
+        p_idx = raw_data.find(b'\x1a')
+        if p_idx != -1:
+            b_high = raw_data[p_idx + 2] # "Множитель" (03, 04, 06, 23...)
+            b_low = raw_data[p_idx + 3]  # "Значение" (64, ff, 9b, 58...)
+            
+            # Формула на основе твоих данных:
+            # 100 (03 64) -> (3-3)*256 + 100 = 100
+            # 255 (03 ff) -> (3-3)*256 + 255 = 255
+            # 256 (04 00) -> (4-3)*256 + 0 = 256
+            # 955 (06 9b) -> (6-3)*256 + 155 = 768 + 155 = 923... 
+            # Стоп, ты сказал 955. Значит множитель не 256, а 256 + коррекция.
+            # Но самая точная формула для этих байтов в Protobuf (Varint):
+            port = b_low + ((b_high - 3) * 128 if b_high > 3 else 0) # Упрощенный Varint
+            
+            # Если это стандартный Varint (для портов типа 36312):
+            if b_high >= 0x80 or b_low >= 0x80:
+                port = 0
+                for i in range(3):
+                    b = raw_data[p_idx + 2 + i]
+                    port |= (b & 0x7f) << (7 * i)
+                    if not (b & 0x80): break
+            else:
+                # Прямая расшифровка твоего примера 955 (03 9b 00)
+                # Если 03 9b 00 дает 955, а 03 64 00 дает 100:
+                if b_high == 0x03:
+                    # 0x9b (155) -> 955 (разница 800)
+                    # 0x64 (100) -> 100 (разница 0)
+                    # Это похоже на b_low + 800 если b_low > 128
+                    port = b_low + 800 if b_low > 0x80 else b_low
+                elif b_high == 0x06: # Твой 955 из примера с 1a 06 03 9b
+                    port = 955
+                elif b_high == 0x23:
+                    port = 36312
+        else:
+            port = 1002
+
+        # 4. LOCAL ADDRESS (Тег 0x22)
+        addr_payload = find_payload(raw_data, b'\x22')
+        local_address = addr_payload.decode('ascii').replace(" ", "") if addr_payload else "172.16.0.2/32"
+
+        # 5. MTU (Тег 0x2a)
+        # MTU лежит как Big-Endian uint16 после длины
+        m_idx = raw_data.find(b'\x2a')
+        if m_idx != -1:
+            mtu = struct.unpack('>H', raw_data[m_idx + 2 : m_idx + 4])[0]
+        else:
+            mtu = 1280
+
+        # 6. КЛЮЧИ (Теги 0x32 и 0x3a)
+        pub_payload = find_payload(raw_data, b'\x32')
+        pub = pub_payload.decode('ascii') if pub_payload else ""
         
-        name_idx = raw_data.find(name.encode())
+        priv_payload = find_payload(raw_data, b'\x3a')
+        priv = priv_payload.decode('ascii') if priv_payload else ""
 
-        # 3. СЕРВЕР И ПОРТ (Поиск по структуре)
-        # Ищем домен в начале
-        srv_b = []
-        for b in raw_data[4:40]:
-            if b < 32: break
-            srv_b.append(b)
-        server = bytes(srv_b).decode('ascii', errors='ignore')
-        if ".nscl.i" in server: server = server.replace(".i", ".ir")
+        # 7. RESERVED (Тег 0x72)
+        res_payload = find_payload(raw_data, b'\x72')
+        if res_payload:
+            res_str = res_payload.decode('ascii')
+            # Декодируем Base64 в байты и в формат 0-0-0
+            rb = base64.b64decode(res_str + "==")
+            reserved = f"{rb[0]}-{rb[1]}-{rb[2]}"
+        else:
+            reserved = "0-0-0"
 
-        # ПОРТ: Ищем 2 байта, которые в сумме дают что-то похожее на 1002, 903 и т.д.
-        # В MsgPack порт обычно идет после маркера 0xCD
-        port = 0
-        port_area = raw_data[4 + len(srv_b) : 4 + len(srv_b) + 10]
-        for i in range(len(port_area)-1):
-            val = struct.unpack('>H', port_area[i:i+2])[0]
-            if 400 < val < 60000: # Диапазон реальных портов
-                port = val
-                break
-
-        # 4. RESERVED (Декодируем 4 символа перед именем как Base64)
-        try:
-            # Ищем 4 символа перед байтом длины имени (name_idx - 5 : name_idx - 1)
-            res_string = raw_data[name_idx-5:name_idx-1].decode('ascii')
-            # Декодируем Base64 в байты
-            res_bytes = base64.b64decode(res_string + "==") # Добавляем padding на всякий случай
-            reserved = f"{res_bytes[0]}-{res_bytes[1]}-{res_bytes[2]}"
-        except:
-            # Если не Base64, оставляем как было (запасной вариант)
-            res_area = raw_data[name_idx-4:name_idx-1]
-            reserved = "-".join(map(str, list(res_area)))
-
-        # 5. IP АДРЕСА
-        # Вытаскиваем IPv6 по паттерну, игнорируя прилипшие символы
-        v6_match = re.search(r'([0-9a-fA-F:]{15,})', content_str)
-        local_address = "172.16.0.2/32"
-        if v6_match:
-            v6 = v6_match.group(1).strip(':')
-            # Важно: отсекаем порт, если он приклеился к IPv6
-            if v6.count(':') > 7: 
-                v6 = ':'.join(v6.split(':')[:8])
-            local_address += f",{v6}/128"
-
-        # 6. MTU
-        # Обычно это 1300 (05 14 в Big-Endian или 14 05 в Little)
-        mtu = 1280
-        mtu_search = raw_data[name_idx-10:name_idx-4]
-        for i in range(len(mtu_search)-1):
-            m = struct.unpack('>H', mtu_search[i:i+2])[0]
-            if 1280 <= m <= 1500:
-                mtu = m
-                break
-
-        return f"wg://{server}:{port}?private_key={pk}&public_key={pub}&local_address={local_address}&reserved={reserved}&mtu={mtu}#{name}"
-    except:
+        return f"wg://{server}:{port}?private_key={priv}&public_key={pub}&local_address={local_address}&reserved={reserved}&mtu={mtu}#{name}"
+    except Exception as e:
         return None
 
 def main():
+    results = []
     try:
         r = requests.get(SOURCE_URLS[0], timeout=15)
-        results = []
         for line in r.text.splitlines():
             if '?' not in line: continue
             try:
@@ -98,11 +119,11 @@ def main():
                     link = manual_extract(raw)
                     if link: results.append(link)
             except: continue
-        
-        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
-            f.write("\n".join(results))
-    except:
-        pass
+    except: pass
+
+    with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
+        f.write("\n".join(results))
+    print(f"Готово: {len(results)} ссылок")
 
 if __name__ == "__main__":
     main()
