@@ -46,12 +46,17 @@ def manual_extract(raw_data):
                 port = val
                 break
 
-        # 4. RESERVED (3 байта из 4-х символьного блока перед именем)
-        # Если блок zD2C, то Reserved это коды символов z, D, 2
-        # Мы ищем 4 печатных символа прямо перед длиной имени (name_idx - 1)
-        res_area = raw_data[name_idx-5:name_idx-1]
-        # Берем только первые 3 байта из этого блока
-        reserved = f"{res_area[0]}-{res_area[1]}-{res_area[2]}"
+        # 4. RESERVED (Декодируем 4 символа перед именем как Base64)
+        try:
+            # Ищем 4 символа перед байтом длины имени (name_idx - 5 : name_idx - 1)
+            res_string = raw_data[name_idx-5:name_idx-1].decode('ascii')
+            # Декодируем Base64 в байты
+            res_bytes = base64.b64decode(res_string + "==") # Добавляем padding на всякий случай
+            reserved = f"{res_bytes[0]}-{res_bytes[1]}-{res_bytes[2]}"
+        except:
+            # Если не Base64, оставляем как было (запасной вариант)
+            res_area = raw_data[name_idx-4:name_idx-1]
+            reserved = "-".join(map(str, list(res_area)))
 
         # 5. IP АДРЕСА
         # Вытаскиваем IPv6 по паттерну, игнорируя прилипшие символы
